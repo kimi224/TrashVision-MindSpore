@@ -132,9 +132,28 @@ celerybeat.pid
 .venv
 env/
 venv/
+_vendor/
 ENV/
 env.bak/
 venv.bak/
+data/
+
+# ─── 本项目：体积较大的实验产物（均可由脚本重新生成 / 重新下载） ────────────
+# 预训练权重与零散 checkpoint 输出目录
+pretrain_checkpoint/
+ckpt_0/
+# checkpoint、图元数据、特征缓存
+*.ckpt
+*.meta
+*.npz
+# 训练日志
+logs/
+
+# runs/ 只跟踪实验结果摘要（便于对照复现），其余产物忽略
+runs/**
+!runs/**/
+!runs/*.json
+!runs/**/summary*.json
 
 # Spyder project settings
 .spyderproject

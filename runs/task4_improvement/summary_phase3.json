@@ -1,0 +1,14 @@
+{
+  "baseline_linear": 0.8769230769230769,
+  "vwide5_1024": 0.9038461538461539,
+  "diverse_ensemble": 0.9,
+  "vwide5_1024_seed23": 0.8769230769230769,
+  "vwide5_1024_seed42": 0.9,
+  "ensemble_vwide3seeds": 0.9,
+  "ensemble_vwide_diverse": 0.9038461538461539,
+  "ensemble_all5": 0.9,
+  "tta_vwide_flip": 0.8961538461538462,
+  "tta_diverse_flip": 0.8961538461538462,
+  "tta_vwide_multi": 0.9038461538461539,
+  "combined_ensemble_tta": 0.8961538461538462
+}

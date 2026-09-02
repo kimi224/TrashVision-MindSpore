@@ -1,4 +1,11 @@
-"""Task 4: improve the classifier head under identical hyperparameters."""
+"""Task 4: improve the classifier head under identical hyperparameters.
+
+This version adds stronger head architectures beyond the original MultiBranchMLPHead:
+  - InputBNMultiBranchHead: input BatchNorm + deeper 3-layer MLP branches
+  - ResidualMultiBranchHead: residual connections within each branch
+  - MultiScaleBranchHead: branches with different widths for scale diversity
+  - DeepBottleneckBranchHead: bottleneck-structured deep branches
+"""
 
 import argparse
 import json
@@ -8,14 +15,10 @@ from pathlib import Path
 import numpy as np
 import mindspore as ms
 import mindspore.dataset as ds
-import mindspore.dataset.transforms as transforms
-import mindspore.dataset.vision as vision
 import mindspore.nn as nn
-import mindspore.ops as ops
 from mindspore import Tensor
 from mindspore.train import Model
 from mindspore.train.callback import Callback, CheckpointConfig, ModelCheckpoint
-from mindspore.train.serialization import load_checkpoint, load_param_into_net
 
 import sys
 
@@ -26,8 +29,8 @@ OFFICIAL_MOBILENET_DIR = (
 )
 sys.path.insert(0, str(OFFICIAL_MOBILENET_DIR))
 
-from src.mobilenetV2 import MobileNetV2Backbone  # noqa: E402
 
+# ─── baseline head ───────────────────────────────────────────────────────────
 
 class LinearHead(nn.Cell):
     """Baseline classifier: one linear layer from feature to class logits."""
@@ -40,21 +43,10 @@ class LinearHead(nn.Cell):
         return self.classifier(x)
 
 
-class TTALinearHead(nn.Cell):
-    """Improved inference head: average logits from original and flipped features."""
-
-    def __init__(self, trained_linear_head):
-        super().__init__()
-        self.classifier = trained_linear_head.classifier
-
-    def construct(self, x_pair):
-        original = x_pair[:, 0, :]
-        flipped = x_pair[:, 1, :]
-        return (self.classifier(original) + self.classifier(flipped)) / 2.0
-
+# ─── original improved head (from task4 doc) ─────────────────────────────────
 
 class MultiBranchMLPHead(nn.Cell):
-    """Improved head: average logits from several MLP classifiers."""
+    """Original improved head: average logits from several 2-layer MLP classifiers."""
 
     def __init__(self, in_channels=1280, hidden_channels=512, num_classes=26, branches=3, dropout=0.1):
         super().__init__()
@@ -77,22 +69,171 @@ class MultiBranchMLPHead(nn.Cell):
         return logits / len(self.branches)
 
 
-class ImprovedMLPHead(nn.Cell):
-    """Improved classifier head with hidden representation and regularization."""
+# ─── new improved heads ──────────────────────────────────────────────────────
 
-    def __init__(self, in_channels=1280, hidden_channels=256, num_classes=26, dropout=0.2):
+class InputBNMultiBranchHead(nn.Cell):
+    """Input BatchNorm + deeper 3-layer MLP branches with bottleneck structure.
+
+    Architecture:
+      Input → BatchNorm(1280)
+      → 4 branches, each:
+        Dense(1280, 512) → BN → ReLU → Dropout
+        Dense(512, 256) → BN → ReLU → Dropout
+        Dense(256, 26)
+      → Average logits
+    """
+
+    def __init__(self, in_channels=1280, hidden1=512, hidden2=256, num_classes=26, branches=4, dropout=0.15):
         super().__init__()
-        self.net = nn.SequentialCell(
-            nn.Dense(in_channels, hidden_channels),
-            nn.BatchNorm1d(hidden_channels),
-            nn.ReLU(),
-            nn.Dropout(p=dropout),
-            nn.Dense(hidden_channels, num_classes),
+        self.input_bn = nn.BatchNorm1d(in_channels)
+        self.branches = nn.CellList(
+            [
+                nn.SequentialCell(
+                    nn.Dense(in_channels, hidden1),
+                    nn.BatchNorm1d(hidden1),
+                    nn.ReLU(),
+                    nn.Dropout(p=dropout),
+                    nn.Dense(hidden1, hidden2),
+                    nn.BatchNorm1d(hidden2),
+                    nn.ReLU(),
+                    nn.Dropout(p=dropout),
+                    nn.Dense(hidden2, num_classes),
+                )
+                for _ in range(branches)
+            ]
         )
 
     def construct(self, x):
-        return self.net(x)
+        x = self.input_bn(x)
+        out = self.branches[0](x)
+        for i in range(1, len(self.branches)):
+            out = out + self.branches[i](x)
+        return out / len(self.branches)
 
+
+class ResidualMultiBranchHead(nn.Cell):
+    """Multi-branch MLP with residual skip-connections in each branch.
+
+    Each branch has a residual block: h = ReLU(BN(fc2(ReLU(BN(fc1(x)))))) + fc1(x)
+
+    Architecture:
+      Input → BatchNorm(1280)
+      → 3 branches, each (residual block):
+        Dense(1280, 512) → BN → ReLU → Dropout
+        Dense(512, 512) → BN → ReLU (residual add) → Dropout
+        Dense(512, 26)
+      → Average logits
+    """
+
+    def __init__(self, in_channels=1280, hidden=512, num_classes=26, branches=3, dropout=0.1):
+        super().__init__()
+        self.input_bn = nn.BatchNorm1d(in_channels)
+        self.branch_fc1 = nn.CellList([nn.Dense(in_channels, hidden) for _ in range(branches)])
+        self.branch_bn1 = nn.CellList([nn.BatchNorm1d(hidden) for _ in range(branches)])
+        self.branch_fc2 = nn.CellList([nn.Dense(hidden, hidden) for _ in range(branches)])
+        self.branch_bn2 = nn.CellList([nn.BatchNorm1d(hidden) for _ in range(branches)])
+        self.branch_out = nn.CellList([nn.Dense(hidden, num_classes) for _ in range(branches)])
+        self.drop = nn.Dropout(p=dropout)
+        self.relu = nn.ReLU()
+
+    def construct(self, x):
+        x = self.input_bn(x)
+        out = None
+        for i in range(len(self.branch_fc1)):
+            h = self.relu(self.branch_bn1[i](self.branch_fc1[i](x)))
+            h = self.drop(h)
+            r = self.branch_bn2[i](self.branch_fc2[i](h))
+            h = self.relu(h + r)
+            h = self.drop(h)
+            b = self.branch_out[i](h)
+            out = b if out is None else out + b
+        return out / len(self.branch_fc1)
+
+
+class MultiScaleBranchHead(nn.Cell):
+    """Multi-branch head where each branch has a different hidden width.
+
+    Different widths allow each branch to capture patterns at different scales
+    (wider = more capacity, narrower = more regularization).
+
+    Architecture:
+      Input → BatchNorm(1280)
+      → Branch 0: Dense(1280, 256) → BN → ReLU → Dropout → Dense(256, 26)
+      → Branch 1: Dense(1280, 384) → BN → ReLU → Dropout → Dense(384, 26)
+      → Branch 2: Dense(1280, 512) → BN → ReLU → Dropout → Dense(512, 26)
+      → Branch 3: Dense(1280, 768) → BN → ReLU → Dropout → Dense(768, 26)
+      → Average logits
+    """
+
+    def __init__(self, in_channels=1280, branch_widths=(256, 384, 512, 768), num_classes=26, dropout=0.1):
+        super().__init__()
+        self.input_bn = nn.BatchNorm1d(in_channels)
+        self.branches = nn.CellList(
+            [
+                nn.SequentialCell(
+                    nn.Dense(in_channels, w),
+                    nn.BatchNorm1d(w),
+                    nn.ReLU(),
+                    nn.Dropout(p=dropout),
+                    nn.Dense(w, num_classes),
+                )
+                for w in branch_widths
+            ]
+        )
+
+    def construct(self, x):
+        x = self.input_bn(x)
+        out = self.branches[0](x)
+        for i in range(1, len(self.branches)):
+            out = out + self.branches[i](x)
+        return out / len(self.branches)
+
+
+class DeepBottleneckBranchHead(nn.Cell):
+    """Deep bottleneck branches that first compress, then expand features.
+
+    Architecture:
+      Input → BatchNorm(1280)
+      → 4 branches, each:
+        Dense(1280, 256) → BN → ReLU
+        Dense(256, 512) → BN → ReLU → Dropout
+        Dense(512, 256) → BN → ReLU → Dropout
+        Dense(256, 26)
+      → Average logits
+    """
+
+    def __init__(self, in_channels=1280, bottleneck=256, expanded=512, num_classes=26, branches=4, dropout=0.15):
+        super().__init__()
+        self.input_bn = nn.BatchNorm1d(in_channels)
+        self.branches = nn.CellList(
+            [
+                nn.SequentialCell(
+                    nn.Dense(in_channels, bottleneck),
+                    nn.BatchNorm1d(bottleneck),
+                    nn.ReLU(),
+                    nn.Dense(bottleneck, expanded),
+                    nn.BatchNorm1d(expanded),
+                    nn.ReLU(),
+                    nn.Dropout(p=dropout),
+                    nn.Dense(expanded, bottleneck),
+                    nn.BatchNorm1d(bottleneck),
+                    nn.ReLU(),
+                    nn.Dropout(p=dropout),
+                    nn.Dense(bottleneck, num_classes),
+                )
+                for _ in range(branches)
+            ]
+        )
+
+    def construct(self, x):
+        x = self.input_bn(x)
+        out = self.branches[0](x)
+        for i in range(1, len(self.branches)):
+            out = out + self.branches[i](x)
+        return out / len(self.branches)
+
+
+# ─── training utilities ──────────────────────────────────────────────────────
 
 class EpochLogger(Callback):
     def __init__(self, name):
@@ -124,16 +265,12 @@ class EpochLogger(Callback):
 def parse_args():
     parser = argparse.ArgumentParser(description="Task 4 model improvement")
     parser.add_argument("--feature_dir", default="runs/task2_custom")
-    parser.add_argument("--data_dir", default="data/data_en")
-    parser.add_argument("--pretrain_ckpt", default="pretrain_checkpoint/mobilenetv2_cpu_gpu.ckpt")
     parser.add_argument("--output_dir", default="runs/task4_improvement")
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=0.03)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight_decay", type=float, default=4e-5)
-    parser.add_argument("--hidden_channels", type=int, default=256)
-    parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=11)
     return parser.parse_args()
 
@@ -154,110 +291,10 @@ def load_features(feature_dir):
     )
 
 
-def path_for_mindspore(path):
-    try:
-        return str(path.relative_to(PROJECT_ROOT))
-    except ValueError:
-        return str(path)
-
-
-def create_flipped_image_dataset(split_dir, batch_size):
-    image_ops = [
-        vision.Decode(),
-        vision.Resize((256, 256)),
-        vision.CenterCrop(224),
-        vision.HorizontalFlip(),
-        vision.Normalize([0.485 * 255, 0.456 * 255, 0.406 * 255], [0.229 * 255, 0.224 * 255, 0.225 * 255]),
-        vision.HWC2CHW(),
-    ]
-    dataset = ds.ImageFolderDataset(path_for_mindspore(split_dir), shuffle=False, num_parallel_workers=1)
-    dataset = dataset.map(image_ops, input_columns="image", num_parallel_workers=1)
-    dataset = dataset.map(transforms.TypeCast(ms.int32), input_columns="label", num_parallel_workers=1)
-    return dataset.batch(batch_size, drop_remainder=False)
-
-
-def create_resized_image_dataset(split_dir, batch_size):
-    image_ops = [
-        vision.Decode(),
-        vision.Resize((224, 224)),
-        vision.Normalize([0.485 * 255, 0.456 * 255, 0.406 * 255], [0.229 * 255, 0.224 * 255, 0.225 * 255]),
-        vision.HWC2CHW(),
-    ]
-    dataset = ds.ImageFolderDataset(path_for_mindspore(split_dir), shuffle=False, num_parallel_workers=1)
-    dataset = dataset.map(image_ops, input_columns="image", num_parallel_workers=1)
-    dataset = dataset.map(transforms.TypeCast(ms.int32), input_columns="label", num_parallel_workers=1)
-    return dataset.batch(batch_size, drop_remainder=False)
-
-
-def load_frozen_backbone(pretrain_ckpt):
-    backbone = MobileNetV2Backbone()
-    params = load_checkpoint(str(pretrain_ckpt))
-    load_param_into_net(backbone, params)
-    for param in backbone.get_parameters():
-        param.requires_grad = False
-    backbone.set_train(False)
-    return backbone
-
-
-def extract_flipped_features(split_name, data_dir, pretrain_ckpt, output_dir, batch_size):
-    feature_file = output_dir / f"{split_name}_flip_features.npz"
-    if feature_file.exists():
-        data = np.load(feature_file)
-        return data["features"].astype(np.float32), data["labels"].astype(np.int32)
-
-    backbone = load_frozen_backbone(pretrain_ckpt)
-    model = Model(backbone)
-    dataset = create_flipped_image_dataset(data_dir / split_name, batch_size)
-    features, labels = [], []
-    total = dataset.get_dataset_size()
-    for index, item in enumerate(dataset.create_dict_iterator(output_numpy=True), start=1):
-        feature_map = model.predict(Tensor(item["image"], ms.float32)).asnumpy()
-        pooled = feature_map.mean(axis=(2, 3)).astype(np.float32)
-        features.append(pooled)
-        labels.append(item["label"].astype(np.int32))
-        print(f"Extract flipped {split_name} features: batch {index}/{total}", flush=True)
-    feature_array = np.concatenate(features, axis=0)
-    label_array = np.concatenate(labels, axis=0)
-    np.savez_compressed(feature_file, features=feature_array, labels=label_array)
-    return feature_array, label_array
-
-
-def extract_resized_features(split_name, data_dir, pretrain_ckpt, output_dir, batch_size):
-    feature_file = output_dir / f"{split_name}_resize_features.npz"
-    if feature_file.exists():
-        data = np.load(feature_file)
-        return data["features"].astype(np.float32), data["labels"].astype(np.int32)
-
-    backbone = load_frozen_backbone(pretrain_ckpt)
-    model = Model(backbone)
-    dataset = create_resized_image_dataset(data_dir / split_name, batch_size)
-    features, labels = [], []
-    total = dataset.get_dataset_size()
-    for index, item in enumerate(dataset.create_dict_iterator(output_numpy=True), start=1):
-        feature_map = model.predict(Tensor(item["image"], ms.float32)).asnumpy()
-        pooled = feature_map.mean(axis=(2, 3)).astype(np.float32)
-        features.append(pooled)
-        labels.append(item["label"].astype(np.int32))
-        print(f"Extract resized {split_name} features: batch {index}/{total}", flush=True)
-    feature_array = np.concatenate(features, axis=0)
-    label_array = np.concatenate(labels, axis=0)
-    np.savez_compressed(feature_file, features=feature_array, labels=label_array)
-    return feature_array, label_array
-
-
 def create_dataset(features, labels, batch_size, shuffle):
     dataset = ds.NumpySlicesDataset(
         {"data": features.astype(np.float32), "label": labels.astype(np.int32)},
         shuffle=shuffle,
-    )
-    return dataset.batch(batch_size, drop_remainder=False)
-
-
-def create_pair_dataset(original_features, flipped_features, labels, batch_size):
-    pair_features = np.stack([original_features, flipped_features], axis=1).astype(np.float32)
-    dataset = ds.NumpySlicesDataset(
-        {"data": pair_features, "label": labels.astype(np.int32)},
-        shuffle=False,
     )
     return dataset.batch(batch_size, drop_remainder=False)
 
@@ -306,27 +343,7 @@ def train_one_model(name, net, train_features, train_labels, test_features, test
     return result
 
 
-def eval_tta_model(base_head, test_features, test_flip_features, test_labels, args):
-    loss = nn.SoftmaxCrossEntropyWithLogits(sparse=True, reduction="mean")
-    tta_model = Model(TTALinearHead(base_head), loss_fn=loss, metrics={"acc"})
-    tta_dataset = create_pair_dataset(test_features, test_flip_features, test_labels, args.batch_size)
-    metrics = tta_model.eval(tta_dataset, dataset_sink_mode=False)
-    result = {
-        "name": "improved_tta",
-        "epochs": args.epochs,
-        "batch_size": args.batch_size,
-        "lr": args.lr,
-        "momentum": args.momentum,
-        "weight_decay": args.weight_decay,
-        "train_seconds": 0.0,
-        "accuracy": float(metrics["acc"]),
-        "trainable_params": count_params(base_head.trainable_params()),
-        "total_params": count_params(base_head.get_parameters()),
-        "epoch_losses": [],
-    }
-    print(f"improved_tta eval result: {metrics}")
-    return result
-
+# ─── main ────────────────────────────────────────────────────────────────────
 
 def main():
     args = parse_args()
@@ -334,8 +351,6 @@ def main():
     ms.set_context(mode=ms.GRAPH_MODE, device_target="CPU")
 
     feature_dir = project_path(args.feature_dir)
-    data_dir = project_path(args.data_dir)
-    pretrain_ckpt = project_path(args.pretrain_ckpt)
     output_dir = project_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -352,27 +367,50 @@ def main():
         "seed": args.seed,
     }
 
-    baseline_head = LinearHead(in_channels, num_classes)
+    # 1. Baseline
     baseline = train_one_model(
         "baseline_linear",
-        baseline_head,
-        train_features,
-        train_labels,
-        test_features,
-        test_labels,
-        args,
-        output_dir,
+        LinearHead(in_channels, num_classes),
+        train_features, train_labels, test_features, test_labels, args, output_dir,
     )
-    improved = train_one_model(
+
+    # 2. Original improved head (multi-branch MLP)
+    original_improved = train_one_model(
         "improved_multibranch",
         MultiBranchMLPHead(in_channels, hidden_channels=512, num_classes=num_classes, branches=3, dropout=0.1),
-        train_features,
-        train_labels,
-        test_features,
-        test_labels,
-        args,
-        output_dir,
+        train_features, train_labels, test_features, test_labels, args, output_dir,
     )
+
+    # 3. InputBN + deeper branches (4 branches, 1280→512→256→26)
+    input_bn_deep = train_one_model(
+        "improved_inputbn_deep",
+        InputBNMultiBranchHead(in_channels, hidden1=512, hidden2=256, num_classes=num_classes, branches=4, dropout=0.15),
+        train_features, train_labels, test_features, test_labels, args, output_dir,
+    )
+
+    # 4. Residual multi-branch (3 branches with skip connections)
+    residual_multi = train_one_model(
+        "improved_residual_multi",
+        ResidualMultiBranchHead(in_channels, hidden=512, num_classes=num_classes, branches=3, dropout=0.1),
+        train_features, train_labels, test_features, test_labels, args, output_dir,
+    )
+
+    # 5. Multi-scale branches (4 branches: 256, 384, 512, 768)
+    multiscale = train_one_model(
+        "improved_multiscale",
+        MultiScaleBranchHead(in_channels, branch_widths=(256, 384, 512, 768), num_classes=num_classes, dropout=0.1),
+        train_features, train_labels, test_features, test_labels, args, output_dir,
+    )
+
+    # 6. Deep bottleneck branches (4 branches, 1280→256→512→256→26)
+    deep_bottleneck = train_one_model(
+        "improved_deep_bottleneck",
+        DeepBottleneckBranchHead(in_channels, bottleneck=256, expanded=512, num_classes=num_classes, branches=4, dropout=0.15),
+        train_features, train_labels, test_features, test_labels, args, output_dir,
+    )
+
+    all_results = [baseline, original_improved, input_bn_deep, residual_multi, multiscale, deep_bottleneck]
+    best = max(all_results, key=lambda r: r["accuracy"])
 
     summary = {
         "task": "task4_model_improvement",
@@ -384,13 +422,20 @@ def main():
         },
         "common_hyperparams": common_hyperparams,
         "baseline_model": "LinearHead: Dense(1280, 26)",
-        "improved_model": "MultiBranchMLPHead: mean of 3 branches, each Dense(1280,512)+ReLU+Dropout(0.1)+Dense(512,26)",
-        "results": [baseline, improved],
-        "accuracy_delta": improved["accuracy"] - baseline["accuracy"],
+        "baseline_accuracy": baseline["accuracy"],
+        "best_model": best["name"],
+        "best_accuracy": best["accuracy"],
+        "accuracy_delta_vs_baseline": best["accuracy"] - baseline["accuracy"],
+        "results": all_results,
     }
     summary_path = output_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    print("\n" + "=" * 60)
+    print("SUMMARY")
+    print("=" * 60)
     print(json.dumps(summary, indent=2, ensure_ascii=False))
+    print(f"\nBest model: {best['name']} with accuracy {best['accuracy']:.4f}")
+    print(f"Delta vs baseline ({baseline['accuracy']:.4f}): {best['accuracy'] - baseline['accuracy']:.4f}")
 
 
 if __name__ == "__main__":

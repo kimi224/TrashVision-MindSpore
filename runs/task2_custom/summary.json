@@ -1,0 +1,42 @@
+{
+  "task": "task2_custom_finetune",
+  "num_classes": 26,
+  "classes": [
+    "Banana Peel",
+    "Basketball",
+    "Battery",
+    "Broom",
+    "Cans",
+    "Cardboard",
+    "Ceramic Bowl",
+    "Dirty Cloth",
+    "Disposable Chopsticks",
+    "Eggshell",
+    "Fluorescent lamp",
+    "Glass Bottle",
+    "Glassware",
+    "Hats",
+    "Lighter",
+    "Metalware",
+    "Newspaper",
+    "Old Mirror",
+    "Orange Peel",
+    "Paint bucket",
+    "Paper",
+    "Plastic Bottle",
+    "Seashell",
+    "Tablet capsules",
+    "Toothbrush",
+    "Vegetable Leaf"
+  ],
+  "train_samples": 2593,
+  "test_samples": 260,
+  "feature_dim": 1280,
+  "epochs": 30,
+  "lr": 0.03,
+  "momentum": 0.9,
+  "weight_decay": 4e-05,
+  "metrics": {
+    "acc": 0.8923076923076924
+  }
+}

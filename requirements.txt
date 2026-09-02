@@ -1,0 +1,7 @@
+# 实验验证环境：Windows 11 / Python 3.12.10 / CPU
+# MindSpore CPU 版本请按官方安装指引选择与 Python 版本匹配的包
+mindspore==2.9.0
+numpy==1.26.4
+pillow==12.2.0
+PyYAML==6.0.3
+psutil==7.2.2
